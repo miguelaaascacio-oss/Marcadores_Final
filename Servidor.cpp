@@ -2,6 +2,7 @@
 #include <opencv2/dnn.hpp> //necesario para dnn filtro de los candidatos similares
 #include "procesa/procesa.h"
 #include "marker/reconoce.h" 
+#include <sys/socket.h>
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <atomic>
@@ -10,16 +11,19 @@
 #include <vector>
 #include <stdio.h>
 #include <unistd.h>
+#include <filesystem>
+#include <fstream>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <array>      // std::array
+#include <cstring>    // memcpy
+#include <cmath>      // sqrt, atan2
+#include <string>
+ 	
 
-std::mutex frame_mutex;
 std::atomic<bool> running(true);
-std::atomic<bool> ready_enviado(false);
 std::atomic<bool> fueraZona(false);
 std::atomic<bool> EnRuta(false);
-
-cv::VideoCapture* cap = nullptr;
-cv::Mat frame;
-
 
 //* --------- ESTRUCTURA DE DATOS --------- /
 struct DatosMarcador {
@@ -27,11 +31,31 @@ struct DatosMarcador {
   bool detectado;
   int etiqueta = 0;    
   std::vector<cv::Point2f> puntos;
+  cv::Point2f centro;
   cv::Matx33d R;
   cv::Vec3d t;
   cv::Vec3d C;  
   double norma;
 };
+
+#pragma pack(push,1)
+struct MarcadorUDP {
+    double ux = 0;
+    double uy = 0;
+    double uz = 0;
+    double norma = -1;
+    double yaw = 0;
+    double altura = 0;
+    double theta = 0;
+};
+struct PaqueteUDP {
+    MarcadorUDP m1;
+    MarcadorUDP m2;
+    MarcadorUDP m3;
+    bool fueraZona = false;
+    bool EnRuta    = false;
+};
+#pragma pack(pop)
 
 // Inversion de eje y para el marco y el triangulo
 constexpr float IMG_H = 480.0f;
@@ -154,11 +178,11 @@ void proyectarMarcador(cv::Mat& img, const DatosMarcador& datos, std::atomic<boo
     constexpr float ymin = 30.0f;
     constexpr float ymax = 450.0f;
     
-    constexpr float xmin2 = 200.0f;
-    constexpr float xmax2 = 440.0f;
+    constexpr float xmin2 = 190.0f;
+    constexpr float xmax2 = 450.0f;
 
-    constexpr float ymin2 = 120.0f;
-    constexpr float ymax2 = 320.0f;
+    constexpr float ymin2 = 110.0f;
+    constexpr float ymax2 = 330.0f;
     
     //x ∈ [30 , 610]
     //y ∈ [30 , 450]
@@ -196,8 +220,8 @@ void proyectarMarcador(cv::Mat& img, const DatosMarcador& datos, std::atomic<boo
 		      
     // Dibujar rectangulo de ruta
 	cv::rectangle(img,
-		      cv::Point(200,120),
-		      cv::Point(440,320),
+		      cv::Point(190,110),
+		      cv::Point(450,330),
 		      enRuta.load() ? cv::Scalar(0,255,0)
 		                       : cv::Scalar(0,0,255),
 		      2);
@@ -271,28 +295,41 @@ void proyectarMarcador(cv::Mat& img, const DatosMarcador& datos, std::atomic<boo
 int main(int /*argc*/, char** /*argv*/)
 {
 
-    //Abrir camara sin hilo
-    
-    cv::VideoCapture cap(2);
+    // --- Socket UDP hacia Python ---
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in servaddr{};
+    servaddr.sin_family      = AF_INET;
+    servaddr.sin_port        = htons(5005);
+    servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+
     int frame_id = 0;
     Ort::Session& session = yolo_session(); //inicia YOLO
     
+    
+    std::string pipeline =
+        "udpsrc port=11111 buffer-size=2048000 ! "      // 1. Recibe paquetes UDP del Tello
+        "h264parse ! "                                   // 2. Reensambla los trozos de video H.264
+        "avdec_h264 max-threads=1 ! "                    // 3. Decodifica H.264 a imagen (1 hilo = menos retraso)
+        "videoconvert ! "                                // 4. Cambia el formato de color YUV → BGR
+        "video/x-raw,format=BGR ! "                      // 5. Obliga a que el formato final sea BGR
+        "appsink drop=true max-buffers=1 sync=false";     // 6. Entrega solo el frame más nuevo, sin esperar
+
+    cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);   // Abre el pipeline con GStreamer
+    
+    
     if (!cap.isOpened()) {
-        std::cerr << "Error: Could not open the camera." << std::endl;
+        std::cerr << "No se pudo abrir el stream con GStreamer." << std::endl;
         return -1;
     }
     
     cv::Mat frame;
-    std::cout << "Streaming camera... Press 'ESC' or 'q' to exit." << std::endl;
 
     while (running.load()) {
-        cv::Mat frame_nativo;
-        cap >> frame;
         
-        if (frame.empty()) {
-            std::cerr << "Error: Blank frame grabbed." << std::endl;
-            break;
-        }
+        cap >> frame; 
+        if (frame.empty()) break;
+        if (cv::waitKey(1) == 27) break; // ESC para salir
 
         // ---------- Preprocesado ----------
         cv::Mat grayFull;
@@ -326,11 +363,9 @@ int main(int /*argc*/, char** /*argv*/)
             // c.x c.y c.w c.h en opencv x,y es la esquina superior izquierda y w en ancho y h el alto de la caja
             
             std::vector<MarcadorHomografia> det =
-                obtener_homografias(frame, grayFull, caja, 70);
-
+                obtener_homografias(frame, grayFull, caja, 115);
             detectados.insert(detectados.end(), det.begin(), det.end());
         }
-
         
         // ---------- Construcción de DatosMarcador ----------
         std::vector<DatosMarcador> marcadores_procesados;
@@ -344,61 +379,86 @@ int main(int /*argc*/, char** /*argv*/)
             
             d.R = m.R;
             d.t = m.t;
-            //d.norma = cv::norm(m.t);
-            
-            //Camara centrado al marcador
-            double tx = d.t[0];
-            double ty = d.t[1];
-            double tz = d.t[2];
+                        
+            d.centro = cv::Point2f(0.f, 0.f); ;
+            for (const auto& p : d.puntos) d.centro += p;
+            if (!d.puntos.empty()) d.centro *= 1.0f / static_cast<float>(d.puntos.size());
 
-            //Marcador centrado en la camara
-            //d.C = -d.R.t() * d.t;
+            //Marcador centrado en la camara vector apuntador U = -C
+            d.C = -d.R.t() * d.t;
             
-            //double cx = d.C[0];
-            //double cy = d.C[1];
-            //double cz = d.C[2];
+            double cx = d.C[0];
+            double cy = d.C[1];
+            double cz = d.C[2];
             
-            //d.norma = std::sqrt((tx * tx) + (ty * ty) + (tz * tz));
+            d.norma = std::sqrt((cx * cx) + (cy * cy) + (cz * cz));
 
-            //d.Rt = cv::Mat::eye(4, 4, CV_64F);
-            //for (int r = 0; r < 3; r++) {
-              //  for (int c = 0; c < 3; c++) d.Rt.at<double>(r, c) = m.R(r, c);
-                //d.Rt.at<double>(r, 3) = m.t[r];
-            //}
-            
             marcadores_procesados.push_back(d);
         }
-        // ---------- Ordenación Y-X (primero el cercano al origen) ----------
+            
+        // ---------- Ordenación Y etiquetas ----------
         std::sort(marcadores_procesados.begin(), marcadores_procesados.end(),
-            [](const DatosMarcador& a, const DatosMarcador& b) {
-                auto prio = [](const std::vector<cv::Point2f>& pts) {
-                    float min_y = std::numeric_limits<float>::max();
-                    float min_x = std::numeric_limits<float>::max();
-                    for (auto& p : pts) {
-                        if (p.y < min_y) { min_y = p.y; min_x = p.x; }
-                        else if (p.y == min_y && p.x < min_x) min_x = p.x;
-                    }
-                    return std::make_pair(min_y, min_x);
-                };
-                auto pa = prio(a.puntos), pb = prio(b.puntos);
-                if (pa.first != pb.first) return pa.first > pb.first;
-                return pa.second < pb.second;
-            });
+            [&](const DatosMarcador& a, const DatosMarcador& b) {
+            return a.centro.y > b.centro.y;
+        });
+        
+        // ---------- Preparar paquete UDP ----------
+        PaqueteUDP paquete;         // default: todo en 0, norma = -1
+        paquete.m1.norma = -1;
+        paquete.m2.norma = -1;
+        paquete.m3.norma = -1;
+
+        fueraZona.store(false);
+        EnRuta.store(false);
 
         // ---------- Iterar marcadores ----------
         int etiqueta_actual = 1;
+    
         for (auto& mp : marcadores_procesados) {
             if (etiqueta_actual > 3) break; 
             mp.etiqueta = etiqueta_actual;
 
             proyectarMarcador(frame, mp, fueraZona, EnRuta);
 
-            // >>> POSE <<<
+            // >>> POSE <<< aqui debe calcular se el U = -Cdron que es el que se va a enviar por cada marcador
+           
+            // >>> CÁLCULO DE POSE <<<
             // t en cm -> m
-            double tx = mp.t[0];
-	    double ty = mp.t[1];
-	    double tz = mp.t[2]; 
-	    //double norma = std::sqrt(tx*tx + ty*ty + tz*tz);
+            double tx = mp.t[0] / 100.0;
+            double ty = mp.t[1] / 100.0;
+            double tz = mp.t[2] / 100.0;
+ 
+            double norma = std::sqrt(tx*tx + ty*ty + tz*tz);
+            double ux = (norma > 1e-9) ? tx / norma : 0.0;
+            double uy = (norma > 1e-9) ? ty / norma : 0.0;
+            double uz = (norma > 1e-9) ? tz / norma : 0.0;
+
+            double nx = mp.R(0, 2);
+            double ny = mp.R(1, 2);
+            double nz = mp.R(2, 2);
+            double altura = std::abs(nx*tx + ny*ty + nz*tz); 
+
+	    
+            // ángulo de la cámara alrededor del marcador, en el plano del marcador
+            double px = -(mp.R(0,0)*tx + mp.R(1,0)*ty + mp.R(2,0)*tz);   // 
+            double py = -(mp.R(0,1)*tx + mp.R(1,1)*ty + mp.R(2,1)*tz);
+            double theta = std::atan2(py, px);
+ 
+            // yaw alrededor del eje Z a partir de R
+            double yaw = std::atan2(tx, -tz);   // 
+                                    
+            // >>> FIN CÁLCULO DE POSE <<<
+	    
+	    MarcadorUDP slot;
+            slot.ux = ux; slot.uy = uy; slot.uz = uz;
+            slot.norma = norma;
+            slot.yaw = yaw;
+            slot.altura = altura;
+            slot.theta = theta;
+
+            if      (etiqueta_actual == 1) paquete.m1 = slot;
+            else if (etiqueta_actual == 2) paquete.m2 = slot;
+            else if (etiqueta_actual == 3) paquete.m3 = slot;
 
             // Texto AR
             int oy = (etiqueta_actual - 1) * 140;
@@ -410,12 +470,16 @@ int main(int /*argc*/, char** /*argv*/)
             cv::putText(frame, buf, {30, 60 + oy},
                         cv::FONT_HERSHEY_SIMPLEX, 0.6, {0,255,0}, 2);
 
-            //printf("E%d -> x:%.2f y:%.2f z:%.2f | norma:%.2f\n",
-                   //mp.etiqueta, tx, ty, tz, norma);
-
             etiqueta_actual++;
         }
         
+        paquete.fueraZona = fueraZona.load();
+        paquete.EnRuta    = EnRuta.load();
+
+        // ---------- Envío UDP ----------
+        sendto(sockfd, &paquete, sizeof(PaqueteUDP), 0,
+               (const struct sockaddr*)&servaddr, sizeof(servaddr));
+               
         // ---------- Visualización ----------
         cv::imshow("Marcador Proyectado", frame);
 
@@ -423,10 +487,10 @@ int main(int /*argc*/, char** /*argv*/)
         if (key == 27 || key == 'q') running = false;
 
         frame_id++;
-        usleep(30000); // ~33 FPS
     }
 
     running = false;
+    if (sockfd >= 0) close(sockfd);
     cap.release();
     cv::destroyAllWindows();
     printf("\nPrograma finalizado.\n");

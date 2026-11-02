@@ -159,7 +159,7 @@ int extrae_perimetro( Mat& Img, int *vals, POINT *pts )
 	return n;
 }
 
-int checa_linea( POINT *pts, int index1, int index2)
+int checa_linea( POINT *pts, int index1, int index2, float piso = 2.5)
 {
 	int i, dx, dy;
 	int distance, indice, val;
@@ -279,20 +279,20 @@ int analiza_perimetro_cuadrado( POINT *pts, int n, DPOINT *pdver )
 	// línea, hace esa línea inválida?
 	// Si, lo intentamos;
 	
-	//const double piso = std::min( 8.0, std::max( 3.0, 0.02 * n ) ); //Tenemos un umbral minimo
-	if ( checa_linea( pts, i1, i2-1) > 0 ){
+	const double piso = std::min( 8.0, std::max( 3.0, 0.02 * n ) ); //Tenemos un umbral minimo
+	if ( checa_linea( pts, i1, i2-1, piso) > 0 ){
 		// printf("# e1\n");
 		return -1;
 	}
-	if ( checa_linea( pts, i2, i3-1) > 0 ){
+	if ( checa_linea( pts, i2, i3-1, piso) > 0 ){
 		// printf("# e2\n");
 		return -2; 
 	}
-	if ( checa_linea( pts, i3, i4-1) > 0 ){
+	if ( checa_linea( pts, i3, i4-1, piso) > 0 ){
 		// printf("# e3\n");
 		return -3; 
 	}
-	if ( checa_linea( pts, i4, n-1) > 0 ){
+	if ( checa_linea( pts, i4, n-1, piso) > 0 ){
 		// printf("# e4\n");
 		return -4; 
 	}

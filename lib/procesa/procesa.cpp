@@ -76,9 +76,11 @@
     
     cv::Mat subImg = IMG(roi); 
 
-    GaussianBlur(subImg, Image, Size(7, 7), 0, 0);  // Smooth filter
-    threshold(Image, Image, um, 255, THRESH_BINARY);
-      
+    GaussianBlur(subImg, Image, Size(5, 5), 0, 0);  // Smooth filter
+    //threshold(Image, Image, um, 255, THRESH_BINARY);
+    double um_otsu = cv::threshold(Image, Image, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    //printf("Otsu: %.0f\n", um_otsu); 
+     
     Image = ~Image;
 
     Mat Image2 = Mat::zeros(Image.rows, Image.cols, CV_8UC1); //mascara de aislamiento del tamano del roi
@@ -590,7 +592,8 @@ void imprimir_lista(){
                              { -1.19908755, -1.38300271},
                              {  1.19908755, -1.38300271}};
 
-      double vdP2[4] = {0.0, 4.16983732, 0.93464052, 4.29112717};
+      //double vdP2[4] = {0.0, 4.16983732, 0.93464052, 4.29112717};
+      double vdP2[4] = {0.0, 18.13879234, 4.06568626, 18.66640319};
       
       double NormalModel3[6][2] = {{ 1.34510517,  1.02010864},
                               { -1.05071661,  1.02010864},

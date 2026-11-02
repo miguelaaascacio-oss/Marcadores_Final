@@ -1,22 +1,7 @@
-# Compilación
-/build/
-*.o
-*.a
-*.out
-
-# Python
 __pycache__/
 *.pyc
-
-# Editores
+build/
+YOLOv5/
 .vscode/
 .idea/
-*.swp
-
-# YOLOv5: resultados y pesos de entrenamiento
-YOLOv5/
-*.pt
-
-# Videos e imágenes de prueba
-*.mp4
-*.avi
+.env
